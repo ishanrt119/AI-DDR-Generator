@@ -1,6 +1,5 @@
-# app.py
 import streamlit as st
-import fitz  # PyMuPDF
+import fitz  
 import os
 import re
 import hashlib
@@ -11,9 +10,6 @@ from reportlab.lib.styles import getSampleStyleSheet
 from datetime import datetime
 from collections import defaultdict
 
-# ---------------------------
-# Utilities: PDF parsing (per-page)
-# ---------------------------
 def extract_text_pages(pdf_bytes: bytes):
     """
     Return list of page texts for the given PDF bytes.
@@ -31,9 +27,6 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
     pages = extract_text_pages(pdf_bytes)
     return "\n".join(pages)
 
-# ---------------------------
-# Image extraction with duplicate & logo filtering
-# ---------------------------
 def md5_bytes(b: bytes):
     m = hashlib.md5()
     m.update(b)
@@ -55,7 +48,6 @@ def extract_images_from_pdf_bytes(pdf_bytes: bytes, output_dir="extracted_images
     saved = []
     md5_counts = defaultdict(int)
 
-    # first pass: collect md5 counts to detect repeated images
     md5_by_xref = {}
     for pno in range(len(doc)):
         page = doc[pno]
@@ -70,7 +62,6 @@ def extract_images_from_pdf_bytes(pdf_bytes: bytes, output_dir="extracted_images
             except Exception:
                 continue
 
-    # second pass: save filtered images
     for pno in range(len(doc)):
         page = doc[pno]
         for img_index, img in enumerate(page.get_images(full=True)):
@@ -82,20 +73,17 @@ def extract_images_from_pdf_bytes(pdf_bytes: bytes, output_dir="extracted_images
                 height = base.get("height", 0)
                 ext = base.get("ext", "png")
 
-                # skip small images
                 if width < min_width or height < min_height:
                     continue
 
                 img_md5 = md5_bytes(image_bytes)
 
-                # skip images that appear many times (logos/watermarks)
                 if md5_counts.get(img_md5, 0) > repeat_threshold:
                     continue
 
                 name = f"{prefix}_p{pno+1}_img{img_index+1}.{ext}"
                 path = os.path.join(output_dir, name)
 
-                # write file (overwrite safe)
                 with open(path, "wb") as f:
                     f.write(image_bytes)
 
@@ -107,16 +95,11 @@ def extract_images_from_pdf_bytes(pdf_bytes: bytes, output_dir="extracted_images
                     "md5": img_md5
                 })
             except Exception:
-                # skip problematic images
                 continue
 
-    # sort images by page then by size descending
     saved = sorted(saved, key=lambda x: (x["page"], -(x["width"] * x["height"])))
     return saved
 
-# ---------------------------
-# Rule-based parsers (areas, issues, thermal)
-# ---------------------------
 AREA_KEYWORDS = [
     "hall", "living", "kitchen", "master bedroom", "master bedroom", "bedroom", "common bathroom", "bathroom",
     "parking", "balcony", "external wall", "terrace", "staircase", "passage", "skirting", "ceiling"
@@ -210,9 +193,6 @@ def extract_thermal_readings_per_page(pages_text: list) -> list:
             })
     return readings
 
-# ---------------------------
-# Analysis & merging logic
-# ---------------------------
 def severity_from_thermal(delta, observation_text):
     reason_parts = []
     sev = "Not Available"
@@ -270,9 +250,6 @@ def recommended_actions_from_root(root):
         ]
     return ["Site verification by a qualified technician recommended."]
 
-# ---------------------------
-# Matching images to findings
-# ---------------------------
 def match_images_for_finding(finding, images, images_by_page):
     """
     Strategy:
@@ -303,9 +280,6 @@ def match_images_for_finding(finding, images, images_by_page):
     # ensure at most 3 images
     return matched[:3]
 
-# ---------------------------
-# DDR Construction
-# ---------------------------
 def generate_ddr_structure(inspection_findings, thermal_readings, images):
     # index thermal readings by area (and also by page)
     thermal_by_area = defaultdict(list)
@@ -376,9 +350,6 @@ def summarize_property(ddr_items):
     issues_list = ", ".join(list(issues)[:8]) if issues else "Not Available"
     return f"{len(areas)} impacted area(s) detected. Key issues observed: {issues_list}."
 
-# ---------------------------
-# PDF report generation
-# ---------------------------
 def generate_pdf_report(file_path, ddr_items, property_summary, metadata=None):
     doc = SimpleDocTemplate(file_path, pagesize=A4, rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=18)
     styles = getSampleStyleSheet()
@@ -437,11 +408,8 @@ def generate_pdf_report(file_path, ddr_items, property_summary, metadata=None):
 
     doc.build(Story)
 
-# ---------------------------
-# Streamlit UI
-# ---------------------------
 st.set_page_config(page_title="AI DDR Generator", layout="wide")
-st.title("AI DDR Generator — Rule-based (Image mapping fixed)")
+st.title("AI DDR Generator")
 
 st.markdown("Upload the Inspection Report (PDF) and Thermal Report (PDF). The app extracts per-page text and images, matches images to observations using page numbers, and generates a DDR.")
 
