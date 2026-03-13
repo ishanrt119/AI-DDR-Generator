@@ -1,0 +1,7 @@
+streamlit
+pymupdf
+Pillow
+reportlab
+python-magic
+pytesseract
+opencv-python
