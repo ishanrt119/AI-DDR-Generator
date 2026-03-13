@@ -49,60 +49,8 @@ The goal of this project is to **automatically analyze inspection data and gener
 
 The AI DDR Generator follows a structured pipeline to convert raw inspection data into a client-ready diagnostic report.
 
-User Upload
-   │
-   ├── Inspection Report (PDF)
-   └── Thermal Report (PDF)
-           │
-           ▼
-PDF Processing Layer
-   │
-   ├── Extract Text from Documents
-   └── Extract Embedded Images
-           │
-           ▼
-Information Extraction
-   │
-   ├── Identify Impacted Areas
-   ├── Detect Structural Issues
-   │      • Dampness
-   │      • Seepage
-   │      • Cracks
-   │      • Tile Joint Gaps
-   │      • Plumbing Leakage
-   │
-   └── Extract Thermal Readings
-          • Hotspot Temperature
-          • Coldspot Temperature
-          • Temperature Difference
-           │
-           ▼
-Analysis Engine
-   │
-   ├── Merge Inspection + Thermal Findings
-   ├── Remove Duplicate Observations
-   ├── Estimate Severity Level
-   ├── Identify Probable Root Cause
-   └── Generate Recommended Repair Actions
-           │
-           ▼
-DDR Report Generator
-   │
-   ├── Property Issue Summary
-   ├── Area-wise Observations
-   ├── Thermal Evidence
-   ├── Severity Assessment
-   ├── Root Cause Analysis
-   ├── Recommended Actions
-   ├── Additional Notes
-   └── Missing / Unclear Information
-           │
-           ▼
-Final Output
-   │
-   ├── Interactive Report Display (Streamlit UI)
-   ├── Download as Markdown
-   └── Download as PDF
+<img width="1024" height="1536" alt="image" src="https://github.com/user-attachments/assets/69fe829d-4cb1-4e9d-92da-c942fde1157b" />
+
 ---
 
 # Technology Stack
