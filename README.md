@@ -70,9 +70,7 @@ The AI DDR Generator follows a structured pipeline to convert raw inspection dat
 Clone the repository:
 
 
-git clone https://github.com/your-username/ai-ddr-generator.git
-
-cd ai-ddr-generator
+git clone https://github.com/ishanrt119/AI-DDR-Generator.git
 
 
 Install dependencies:
