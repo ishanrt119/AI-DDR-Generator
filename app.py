@@ -1,54 +1,76 @@
+# app.py
+# Streamlit app: Automated DDR generator (inspection + thermal) with improved automatic image mapping
+#
+# Key improvements vs earlier versions:
+# - Read uploaded PDFs once (no EmptyFileError)
+# - Extract images and metadata (md5, size, page)
+# - Robust logo / watermark filtering using (repeat count + small size + low unique color count)
+# - Automatic image -> finding mapping using per-page preference + size + filename keyword match + not reusing images where possible
+# - Per-page text extraction to preserve page numbers for mapping
+# - Clear DDR generation (Markdown + PDF)
+#
+# Requirements:
+# pip install streamlit pymupdf pillow reportlab
+
 import streamlit as st
-import fitz  
+import fitz  # PyMuPDF
 import os
 import re
+import math
 import hashlib
+from io import BytesIO
 from PIL import Image
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage
 from reportlab.lib.styles import getSampleStyleSheet
 from datetime import datetime
-from collections import defaultdict
+from collections import defaultdict, Counter
 
-def extract_text_pages(pdf_bytes: bytes):
-    """
-    Return list of page texts for the given PDF bytes.
-    """
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    pages = []
-    for page in doc:
-        pages.append(page.get_text("text"))
-    return pages
-
-def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
-    """
-    Return full text (joined) for convenience.
-    """
-    pages = extract_text_pages(pdf_bytes)
-    return "\n".join(pages)
-
-def md5_bytes(b: bytes):
+# ---------------------------
+# Helpers: text & image extraction
+# ---------------------------
+def md5_bytes(b: bytes) -> str:
+    """Return hex md5 for bytes."""
     m = hashlib.md5()
     m.update(b)
     return m.hexdigest()
 
-def extract_images_from_pdf_bytes(pdf_bytes: bytes, output_dir="extracted_images", prefix="doc",
-                                  min_width=150, min_height=150, repeat_threshold=2):
+def extract_text_pages(pdf_bytes: bytes):
+    """
+    Return list of page texts for the given PDF bytes.
+    (We return a list so we keep page numbers for mapping.)
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    pages = []
+    for page in doc:
+        pages.append(page.get_text("text") or "")
+    doc.close()
+    return pages
+
+def extract_images_from_pdf_bytes(
+    pdf_bytes: bytes,
+    output_dir="extracted_images",
+    prefix="doc",
+    min_width=80,
+    min_height=80,
+    repeat_threshold=3,
+    unique_color_threshold=40
+):
     """
     Extract images from PDF bytes and save to output_dir.
-    Filters:
-      - ignore images smaller than min_width/min_height
-      - ignore exact-duplicate images (md5)
-      - ignore images that repeat more than repeat_threshold times (likely logos)
-    Returns list of dicts with keys: path, page, width, height, md5
+    Filtering applied:
+      - ignore tiny images (min_width/min_height)
+      - ignore images that repeat > repeat_threshold (likely logos/watermarks)
+      - ignore images with very low unique color count AND small width (likely logo)
+    Returns list of dicts with keys: path, page, width, height, md5, unique_colors, area
     """
     os.makedirs(output_dir, exist_ok=True)
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
-    saved = []
-    md5_counts = defaultdict(int)
-
-    md5_by_xref = {}
+    # first pass: compute md5 counts to detect repeated images
+    md5_counts = Counter()
+    xref_to_md5 = {}
+    xref_to_base = {}
     for pno in range(len(doc)):
         page = doc[pno]
         for img in page.get_images(full=True):
@@ -58,32 +80,57 @@ def extract_images_from_pdf_bytes(pdf_bytes: bytes, output_dir="extracted_images
                 b = base["image"]
                 h = md5_bytes(b)
                 md5_counts[h] += 1
-                md5_by_xref[xref] = (h, base)
+                xref_to_md5[xref] = h
+                xref_to_base[xref] = base
             except Exception:
                 continue
 
+    saved = []
+    # second pass: save filtered images and collect metadata
     for pno in range(len(doc)):
         page = doc[pno]
+        # Use page.get_images(full=True) to iterate occurrences
         for img_index, img in enumerate(page.get_images(full=True)):
             xref = img[0]
             try:
-                base = doc.extract_image(xref)
+                # Reuse previously extracted base where possible
+                base = xref_to_base.get(xref)
+                if base is None:
+                    base = doc.extract_image(xref)
                 image_bytes = base["image"]
-                width = base.get("width", 0)
-                height = base.get("height", 0)
+                width = int(base.get("width", 0))
+                height = int(base.get("height", 0))
                 ext = base.get("ext", "png")
 
+                # Skip tiny images
                 if width < min_width or height < min_height:
                     continue
 
                 img_md5 = md5_bytes(image_bytes)
 
+                # Skip images repeated too many times (logos/watermarks)
                 if md5_counts.get(img_md5, 0) > repeat_threshold:
                     continue
 
+                # Quick logo detection: count unique colors on a small resized copy
+                try:
+                    pil = Image.open(BytesIO(image_bytes)).convert("RGB")
+                    # resize to speed up getcolors while preserving palette characteristics
+                    small = pil.resize((60, 60))
+                    # getcolors: returns list of (count, color) up to parameter limit
+                    colors = small.getcolors(maxcolors=5000)
+                    unique_colors = len(colors) if colors else 0
+                except Exception:
+                    unique_colors = 256  # assume colorful if we cannot compute
+
+                # If unique colors low and image relatively small, treat as possible logo
+                if unique_colors < unique_color_threshold and width < 500:
+                    # skip likely logo or simple watermark
+                    continue
+
+                # Save image
                 name = f"{prefix}_p{pno+1}_img{img_index+1}.{ext}"
                 path = os.path.join(output_dir, name)
-
                 with open(path, "wb") as f:
                     f.write(image_bytes)
 
@@ -92,23 +139,32 @@ def extract_images_from_pdf_bytes(pdf_bytes: bytes, output_dir="extracted_images
                     "page": pno + 1,
                     "width": width,
                     "height": height,
-                    "md5": img_md5
+                    "md5": img_md5,
+                    "unique_colors": unique_colors,
+                    "area": width * height
                 })
             except Exception:
                 continue
 
-    saved = sorted(saved, key=lambda x: (x["page"], -(x["width"] * x["height"])))
+    doc.close()
+
+    # sort images by page then descending area so larger images appear first for mapping
+    saved = sorted(saved, key=lambda x: (x["page"], -x["area"]))
     return saved
 
+# ---------------------------
+# Rule-based NLP for inspection + thermal parsing
+# ---------------------------
 AREA_KEYWORDS = [
-    "hall", "living", "kitchen", "master bedroom", "master bedroom", "bedroom", "common bathroom", "bathroom",
+    "hall", "living", "kitchen", "master bedroom", "bedroom", "common bathroom", "bathroom",
     "parking", "balcony", "external wall", "terrace", "staircase", "passage", "skirting", "ceiling"
 ]
 
 ISSUE_KEYWORDS = [
     "damp", "dampness", "seepage", "leakage", "efflorescence", "spalling", "crack", "cracks",
     "hollow", "hollowness", "gaps", "gap", "tile joint", "tile joints", "plumbing", "nahani",
-    "paint", "mold", "algae", "moisture", "wet", "outlet leakage", "gaps between tile", "hollow sound"
+    "paint", "mold", "algae", "moisture", "wet", "outlet leakage", "gaps between tile", "hollow sound",
+    "live leakage", "live leak"
 ]
 
 def find_area_in_sentence(sentence: str) -> str:
@@ -128,16 +184,19 @@ def find_issue_in_sentence(sentence: str) -> str:
 
 def extract_inspection_findings_per_page(pages_text: list) -> list:
     """
-    Scan each page text, find lines that contain issue keywords or 'observed',
-    return findings with page number to enable image mapping.
+    For each page, split into lines and capture lines that likely contain observations.
+    We preserve page number for mapping to images on same page.
     """
     findings = []
     for p_idx, page_text in enumerate(pages_text):
-        # split into sentences/lines
+        if not page_text:
+            continue
+        # split by newline; keep relatively short segments
         lines = [ln.strip() for ln in re.split(r'[\n\r]+', page_text) if ln.strip()]
         for ln in lines:
             lower = ln.lower()
-            if any(k in lower for k in ISSUE_KEYWORDS) or "observed" in lower or "image" in lower:
+            # pick lines with issue keywords or image references or observed words
+            if any(k in lower for k in ISSUE_KEYWORDS) or "observed" in lower or re.search(r'image\s*\d+', lower):
                 if len(ln) < 8:
                     continue
                 area = find_area_in_sentence(ln)
@@ -148,11 +207,11 @@ def extract_inspection_findings_per_page(pages_text: list) -> list:
                     "issues_detected": issue,
                     "page": p_idx + 1
                 })
-    # deduplicate preserving first occurrence
+    # deduplicate (preserve first occurrence)
     uniq = []
     seen = set()
     for f in findings:
-        key = (f["page"], f["area"], f["observation"][:140])
+        key = (f["page"], f["area"], f["observation"][:160])
         if key in seen:
             continue
         seen.add(key)
@@ -165,10 +224,12 @@ def extract_thermal_readings_per_page(pages_text: list) -> list:
     """
     readings = []
     for p_idx, page_text in enumerate(pages_text):
+        if not page_text:
+            continue
         b = page_text.lower()
         hot = None
         cold = None
-        # common patterns used in thermal reports
+        # patterns for temperature values (various formats handled)
         mhot = re.search(r'hot(?:spot| spot)?\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?)\s*°?\s*c', b)
         mcold = re.search(r'cold(?:spot| spot)?\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?)\s*°?\s*c', b)
         if mhot:
@@ -193,6 +254,9 @@ def extract_thermal_readings_per_page(pages_text: list) -> list:
             })
     return readings
 
+# ---------------------------
+# Heuristics: severity, root cause, recommendations
+# ---------------------------
 def severity_from_thermal(delta, observation_text):
     reason_parts = []
     sev = "Not Available"
@@ -250,65 +314,126 @@ def recommended_actions_from_root(root):
         ]
     return ["Site verification by a qualified technician recommended."]
 
-def match_images_for_finding(finding, images, images_by_page):
+# ---------------------------
+# Matching images --> findings (automatic)
+# ---------------------------
+def score_image_for_finding(img_meta, finding, area_keywords=AREA_KEYWORDS):
     """
-    Strategy:
-      1. Prefer images on the same page (images_by_page[finding.page])
-      2. Else, try neighboring pages (page-1, page+1)
-      3. Else, pick top large images overall (sorted by size)
+    Produce a heuristic score for how well an image matches a finding.
+    Score components:
+      - same page bonus
+      - size (area) bonus
+      - filename contains area keyword bonus
+      - image not-logo (unique_colors) bonus (higher is better)
     """
-    page = finding.get("page")
-    matched = []
+    score = 0.0
+    # same page heavy bonus
+    if img_meta.get("page") == finding.get("page"):
+        score += 100.0
+    # size contribution (log area)
+    area = img_meta.get("area", 0) or (img_meta.get("width", 0) * img_meta.get("height", 0))
+    if area > 0:
+        score += math.log(area + 1)  # modest contribution
+    # filename contains area keyword
+    fname = os.path.basename(img_meta.get("path", "")).lower()
+    fscore = 0
+    for kw in area_keywords:
+        if kw in fname and kw in finding.get("area", "").lower():
+            fscore += 10
+    score += fscore
+    # colorfulness / uniqueness penalty/bonus
+    unique_colors = img_meta.get("unique_colors", 100)
+    score += (unique_colors / 50.0)  # more unique colors -> slightly higher
+    return score
 
-    if page in images_by_page:
-        matched = list(images_by_page[page])
+def match_images_for_finding_auto(findings, images, max_images_per_finding=2):
+    """
+    Automatic mapping of images to findings.
+    - Prefer images on same page
+    - Avoid reusing same image for many findings if alternatives exist
+    - Return list of mapped image paths per finding (same order as findings)
+    """
+    # index images by page + keep master list
+    images_by_page = defaultdict(list)
+    for img in images:
+        images_by_page[img["page"]].append(img)
 
-    if not matched:
-        # neighbor pages
-        neighbors = []
-        if page - 1 in images_by_page:
-            neighbors.extend(images_by_page[page - 1])
-        if page + 1 in images_by_page:
-            neighbors.extend(images_by_page[page + 1])
-        matched = neighbors
+    # maintain assigned set to prefer unique assignments
+    assigned = set()
+    mapping = []
 
-    if not matched:
-        # fallback: choose top 2 largest images from all images
-        sorted_images = sorted(images, key=lambda x: -(x["width"] * x["height"]))
-        matched = [img["path"] for img in sorted_images[:2]]
+    for f in findings:
+        candidates = []
+        # candidates: same page first, then neighbors, then global
+        page = f.get("page")
+        if page in images_by_page:
+            candidates.extend(images_by_page[page])
+        if (page - 1) in images_by_page:
+            candidates.extend(images_by_page[page - 1])
+        if (page + 1) in images_by_page:
+            candidates.extend(images_by_page[page + 1])
+        # include global top images as fallback
+        if len(candidates) < 4:
+            # add top 6 largest global images (not duplicates)
+            sorted_global = sorted(images, key=lambda x: -x["area"])
+            for g in sorted_global[:8]:
+                if g not in candidates:
+                    candidates.append(g)
 
-    # ensure at most 3 images
-    return matched[:3]
+        # score each candidate
+        scored = []
+        for img_meta in candidates:
+            sc = score_image_for_finding(img_meta, f)
+            # penalize already assigned images moderately so app prefers distinct images
+            if img_meta["path"] in assigned:
+                sc *= 0.6
+            scored.append((sc, img_meta))
 
+        # pick top N candidates by score (and mark assigned)
+        scored_sorted = sorted(scored, key=lambda x: -x[0])
+        chosen = []
+        for s, img_meta in scored_sorted:
+            if len(chosen) >= max_images_per_finding:
+                break
+            # small safety: ensure image file exists
+            if os.path.exists(img_meta["path"]):
+                chosen.append(img_meta["path"])
+                assigned.add(img_meta["path"])
+        mapping.append(chosen)
+    return mapping
+
+# ---------------------------
+# DDR generation & PDF
+# ---------------------------
 def generate_ddr_structure(inspection_findings, thermal_readings, images):
-    # index thermal readings by area (and also by page)
+    """
+    Merge inspection findings with thermal readings and mapped images to produce DDR structure.
+    Uses auto image mapping algorithm.
+    """
+    # index thermal by area and page
     thermal_by_area = defaultdict(list)
     for t in thermal_readings:
         thermal_by_area[t.get("area", "Not Available")].append(t)
 
-    # index images by page -> list of paths
-    images_by_page = defaultdict(list)
-    for img in images:
-        images_by_page[img["page"]].append(img["path"])
+    # create image mappings for all findings
+    image_map_lists = match_images_for_finding_auto(inspection_findings, images, max_images_per_finding=2)
 
     ddr_items = []
-    for f in inspection_findings:
+    for idx, f in enumerate(inspection_findings):
         area = f["area"]
         obs = f["observation"]
-        page = f.get("page", None)
+        page = f.get("page")
         issues = f["issues_detected"]
 
-        # try to find thermal reading by area or by page
+        # find thermal candidate by area, else by page else first available
         t_candidate = None
         if thermal_by_area.get(area):
-            # pick reading with largest delta if present
             t_list = [t for t in thermal_by_area[area] if t.get("delta") is not None]
             if t_list:
                 t_candidate = sorted(t_list, key=lambda x: -(x.get("delta") or 0))[0]
             else:
                 t_candidate = thermal_by_area[area][0]
         else:
-            # fallback: thermal reading for same page
             t_by_page = [t for t in thermal_readings if t.get("page") == page]
             if t_by_page:
                 t_candidate = t_by_page[0]
@@ -323,7 +448,7 @@ def generate_ddr_structure(inspection_findings, thermal_readings, images):
         probable_root = probable_root_cause_from_issue(issues if issues != "Not Available" else obs)
         recs = recommended_actions_from_root(probable_root)
 
-        matched_images = match_images_for_finding(f, images, images_by_page)
+        images_for_this = image_map_lists[idx] if idx < len(image_map_lists) else []
 
         ddr_items.append({
             "area": area,
@@ -335,7 +460,7 @@ def generate_ddr_structure(inspection_findings, thermal_readings, images):
             "severity_reasoning": reasoning,
             "probable_root_cause": probable_root,
             "recommended_actions": recs,
-            "images": matched_images
+            "images": images_for_this
         })
 
     return ddr_items
@@ -363,6 +488,7 @@ def generate_pdf_report(file_path, ddr_items, property_summary, metadata=None):
         meta_text = f"Date: {datetime.now().strftime('%Y-%m-%d')}"
     Story.append(Paragraph(meta_text, styles['Normal']))
     Story.append(Spacer(1, 12))
+
     Story.append(Paragraph("Property Issue Summary", styles['Heading2']))
     Story.append(Paragraph(property_summary, styles['Normal']))
     Story.append(Spacer(1, 12))
@@ -408,56 +534,85 @@ def generate_pdf_report(file_path, ddr_items, property_summary, metadata=None):
 
     doc.build(Story)
 
+# ---------------------------
+# Streamlit UI
+# ---------------------------
 st.set_page_config(page_title="AI DDR Generator", layout="wide")
-st.title("AI DDR Generator")
+st.title("AI DDR Generator — Automatic Image Mapping")
 
-st.markdown("Upload the Inspection Report (PDF) and Thermal Report (PDF). The app extracts per-page text and images, matches images to observations using page numbers, and generates a DDR.")
+st.markdown(
+    """
+Upload the **Inspection Report (PDF)** and **Thermal Report (PDF)**.  
+This app automatically extracts text and images, filters logos/watermarks, maps images to observations (auto), and generates a DDR (Markdown + PDF).
+"""
+)
 
 col1, col2 = st.columns(2)
 with col1:
-    inspection_file = st.file_uploader("Upload Inspection Report (PDF)", type=["pdf"])
+    inspection_file = st.file_uploader("Upload Inspection Report (PDF)", type=["pdf"], key="insp")
 with col2:
-    thermal_file = st.file_uploader("Upload Thermal Report (PDF)", type=["pdf"])
+    thermal_file = st.file_uploader("Upload Thermal Report (PDF)", type=["pdf"], key="therm")
+
+# Optional parameter controls to allow tuning if needed
+with st.expander("Image extraction tuning (advanced)"):
+    min_width = st.number_input("Min image width (px)", value=80, min_value=20, max_value=2000)
+    min_height = st.number_input("Min image height (px)", value=80, min_value=20, max_value=2000)
+    repeat_threshold = st.number_input("Repeat threshold (skip images repeating > N times)", value=3, min_value=1, max_value=20)
+    unique_color_threshold = st.number_input("Unique color threshold (logo detector)", value=40, min_value=1, max_value=5000)
 
 if st.button("Generate DDR"):
     if not inspection_file or not thermal_file:
-        st.warning("Please upload both files.")
+        st.warning("Please upload both Inspection and Thermal PDF files.")
     else:
-        # Read files ONCE and reuse bytes
+        # Read file bytes once and reuse
         insp_bytes = inspection_file.read()
         therm_bytes = thermal_file.read()
 
-        # Extract per-page text
-        with st.spinner("Extracting text..."):
+        # Extract text per page
+        with st.spinner("Extracting text pages..."):
             insp_pages = extract_text_pages(insp_bytes)
             therm_pages = extract_text_pages(therm_bytes)
-            insp_text = "\n".join(insp_pages)
-            therm_text = "\n".join(therm_pages)
 
-        # Extract and filter images (uses same bytes)
-        with st.spinner("Extracting images..."):
-            insp_images = extract_images_from_pdf_bytes(insp_bytes, output_dir="images", prefix="insp")
-            therm_images = extract_images_from_pdf_bytes(therm_bytes, output_dir="images", prefix="therm")
+        # Extract images with filtering
+        with st.spinner("Extracting and filtering images..."):
+            insp_images = extract_images_from_pdf_bytes(
+                insp_bytes,
+                output_dir="images",
+                prefix="insp",
+                min_width=min_width,
+                min_height=min_height,
+                repeat_threshold=repeat_threshold,
+                unique_color_threshold=unique_color_threshold
+            )
+            therm_images = extract_images_from_pdf_bytes(
+                therm_bytes,
+                output_dir="images",
+                prefix="therm",
+                min_width=min_width,
+                min_height=min_height,
+                repeat_threshold=repeat_threshold,
+                unique_color_threshold=unique_color_threshold
+            )
             all_images = insp_images + therm_images
 
-        st.success("Parsing complete.")
+        st.success(f"Parsed text ({len(insp_pages)} insp pages, {len(therm_pages)} thermal pages) and extracted {len(all_images)} images.")
 
-        # Show small previews
-        st.subheader("Inspection: text preview (page 1)")
+        # Show previews (safe)
+        st.subheader("Inspection: page 1 preview")
         st.text_area("Inspection page 1", value=(insp_pages[0][:2000] if insp_pages else "No text"), height=180)
-        st.subheader("Thermal: text preview (page 1)")
+        st.subheader("Thermal: page 1 preview")
         st.text_area("Thermal page 1", value=(therm_pages[0][:2000] if therm_pages else "No text"), height=180)
 
-        # Analysis
-        with st.spinner("Extracting findings and matching images..."):
+        # Analysis: extract findings and thermal readings, then auto-map images
+        with st.spinner("Extracting findings and auto-mapping images..."):
             inspection_findings = extract_inspection_findings_per_page(insp_pages)
             thermal_readings = extract_thermal_readings_per_page(therm_pages)
             ddr_items = generate_ddr_structure(inspection_findings, thermal_readings, all_images)
             property_summary = summarize_property(ddr_items)
         st.success("Extraction & mapping complete.")
 
-        # Display DDR items
-        st.header("Generated DDR")
+        # Show DDR items and mapped images
+        st.header("Generated DDR (preview)")
         st.markdown(f"**Property Summary:** {property_summary}")
 
         for idx, it in enumerate(ddr_items, start=1):
@@ -472,7 +627,7 @@ if st.button("Generate DDR"):
             st.write("**Recommended Actions:**")
             for rec in it['recommended_actions']:
                 st.write("-", rec)
-            st.write("**Images (mapped):**")
+            st.write("**Images (auto-mapped):**")
             if it['images']:
                 cols = st.columns(min(3, len(it['images'])))
                 for i, p in enumerate(it['images']):
@@ -485,7 +640,7 @@ if st.button("Generate DDR"):
                 st.write("Image Not Available")
             st.markdown("---")
 
-        # Markdown report
+        # Create markdown report for download
         md_lines = []
         md_lines.append("# Detailed Diagnostic Report (DDR)\n")
         md_lines.append(f"**Property Summary:** {property_summary}\n\n")
@@ -507,7 +662,6 @@ if st.button("Generate DDR"):
             else:
                 md_lines.append("Image Not Available\n")
             md_lines.append("\n---\n")
-
         md_lines.append("## Additional Notes\n")
         md_lines.append("Report generated using rule-based automated extraction. Validate before action.\n")
         md_lines.append("## Missing or Unclear Information\n")
@@ -534,4 +688,4 @@ if st.button("Generate DDR"):
         with open(pdf_path, "rb") as f:
             st.download_button("Download DDR as PDF", data=f, file_name="DDR_Report.pdf", mime="application/pdf")
 
-        st.info("Review the mapped images and report before using for remedial work. Heuristic mapping was used; manual validation recommended.")
+        st.info("Auto-mapping complete. Please review mapped images — heuristics were used; manual validation is recommended for final deliverables.")
