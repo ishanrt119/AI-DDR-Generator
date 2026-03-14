@@ -1,17 +1,3 @@
-# app.py
-# Streamlit app: Automated DDR generator (inspection + thermal) with improved automatic image mapping
-#
-# Key improvements vs earlier versions:
-# - Read uploaded PDFs once (no EmptyFileError)
-# - Extract images and metadata (md5, size, page)
-# - Robust logo / watermark filtering using (repeat count + small size + low unique color count)
-# - Automatic image -> finding mapping using per-page preference + size + filename keyword match + not reusing images where possible
-# - Per-page text extraction to preserve page numbers for mapping
-# - Clear DDR generation (Markdown + PDF)
-#
-# Requirements:
-# pip install streamlit pymupdf pillow reportlab
-
 import streamlit as st
 import fitz  # PyMuPDF
 import os
@@ -26,9 +12,6 @@ from reportlab.lib.styles import getSampleStyleSheet
 from datetime import datetime
 from collections import defaultdict, Counter
 
-# ---------------------------
-# Helpers: text & image extraction
-# ---------------------------
 def md5_bytes(b: bytes) -> str:
     """Return hex md5 for bytes."""
     m = hashlib.md5()
@@ -152,9 +135,6 @@ def extract_images_from_pdf_bytes(
     saved = sorted(saved, key=lambda x: (x["page"], -x["area"]))
     return saved
 
-# ---------------------------
-# Rule-based NLP for inspection + thermal parsing
-# ---------------------------
 AREA_KEYWORDS = [
     "hall", "living", "kitchen", "master bedroom", "bedroom", "common bathroom", "bathroom",
     "parking", "balcony", "external wall", "terrace", "staircase", "passage", "skirting", "ceiling"
@@ -254,9 +234,6 @@ def extract_thermal_readings_per_page(pages_text: list) -> list:
             })
     return readings
 
-# ---------------------------
-# Heuristics: severity, root cause, recommendations
-# ---------------------------
 def severity_from_thermal(delta, observation_text):
     reason_parts = []
     sev = "Not Available"
@@ -314,9 +291,6 @@ def recommended_actions_from_root(root):
         ]
     return ["Site verification by a qualified technician recommended."]
 
-# ---------------------------
-# Matching images --> findings (automatic)
-# ---------------------------
 def score_image_for_finding(img_meta, finding, area_keywords=AREA_KEYWORDS):
     """
     Produce a heuristic score for how well an image matches a finding.
@@ -402,9 +376,6 @@ def match_images_for_finding_auto(findings, images, max_images_per_finding=2):
         mapping.append(chosen)
     return mapping
 
-# ---------------------------
-# DDR generation & PDF
-# ---------------------------
 def generate_ddr_structure(inspection_findings, thermal_readings, images):
     """
     Merge inspection findings with thermal readings and mapped images to produce DDR structure.
@@ -534,9 +505,6 @@ def generate_pdf_report(file_path, ddr_items, property_summary, metadata=None):
 
     doc.build(Story)
 
-# ---------------------------
-# Streamlit UI
-# ---------------------------
 st.set_page_config(page_title="AI DDR Generator", layout="wide")
 st.title("AI DDR Generator — Automatic Image Mapping")
 
